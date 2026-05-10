@@ -12,13 +12,276 @@ import numpy as np
 import scipy.io.wavfile as wav
 import pyaudiowpatch as pyaudio
 import sounddevice as sd
-import deepl
 import pystray
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 from pathlib import Path
 from scipy.signal import resample_poly
 from math import gcd
+import requests
+import openai
+
+FIREBASE_API_KEY = "AIzaSyDyHSTKmUMoAUOiooycyhlXf7Xj-Lkv2SE"
+FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts"
+
+# ───────────── Firebase 인증 ─────────────
+def firebase_login(email, password):
+    url = f"{FIREBASE_AUTH_URL}:signInWithPassword?key={FIREBASE_API_KEY}"
+    res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    return res.json()
+
+def firebase_signup(email, password):
+    url = f"{FIREBASE_AUTH_URL}:signUp?key={FIREBASE_API_KEY}"
+    res = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    return res.json()
+
+FIRESTORE_URL = f"https://firestore.googleapis.com/v1/projects/testserver-8be07/databases/(default)/documents"
+
+def check_approved(uid, id_token):
+    """Firestore에서 승인 여부 확인"""
+    url = f"{FIRESTORE_URL}/users/{uid}"
+    res = requests.get(url, headers={"Authorization": f"Bearer {id_token}"})
+    data = res.json()
+    if "fields" not in data:
+        return False
+    return data["fields"].get("approved", {}).get("booleanValue", False)
+
+def check_duplicate_student_id(student_id, id_token):
+    """학번 중복 확인"""
+    url = f"{FIRESTORE_URL}:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "users"}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "student_id"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": student_id}
+                }
+            },
+            "limit": 1
+        }
+    }
+    res = requests.post(url, json=body, headers={"Authorization": f"Bearer {id_token}"})
+    data = res.json()
+    # 결과가 있으면 중복
+    return any("document" in item for item in data)
+
+def create_user_doc(uid, email, name, student_id, id_token):
+    """회원가입 시 Firestore에 미승인 상태로 등록"""
+    url = f"{FIRESTORE_URL}/users/{uid}"
+    body = {
+        "fields": {
+            "email": {"stringValue": email},
+            "name": {"stringValue": name},
+            "student_id": {"stringValue": student_id},
+            "approved": {"booleanValue": False}
+        }
+    }
+    requests.patch(url, json=body, headers={"Authorization": f"Bearer {id_token}"})
+
+# ───────────── 로그인 화면 ─────────────
+class LoginWindow(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        self.title("실시간 번역기 - 로그인")
+        self.resizable(False, False)
+        self.update_idletasks()
+        w, h = 400, 620
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.configure(fg_color="#111111")
+
+        self.user_token = None
+        self._build_ui()
+
+    def _build_ui(self):
+        # 헤더
+        header = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0, height=90)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ctk.CTkLabel(
+            header, text="🌐  실시간 번역기",
+            font=ctk.CTkFont(size=22, weight="bold"), text_color="white"
+        ).pack(side="left", padx=24, pady=28)
+
+        # 로그인 탭
+        self.tab_var = ctk.StringVar(value="로그인")
+        tab_frame = ctk.CTkFrame(self, fg_color="transparent")
+        tab_frame.pack(fill="x", padx=20, pady=(20, 0))
+        ctk.CTkSegmentedButton(
+            tab_frame, values=["로그인", "회원가입"],
+            variable=self.tab_var, height=38,
+            font=ctk.CTkFont(size=15),
+            selected_color="#2563eb", selected_hover_color="#1d4ed8",
+            unselected_color="#252525", unselected_hover_color="#333333",
+            command=self._on_tab_change
+        ).pack(fill="x")
+
+        # 입력 폼
+        form = ctk.CTkFrame(self, fg_color="#1c1c1c", corner_radius=12)
+        form.pack(fill="x", padx=20, pady=(12, 0))
+
+        ctk.CTkLabel(form, text="이메일", font=ctk.CTkFont(size=14),
+                     text_color="#888888", anchor="w").pack(fill="x", padx=16, pady=(14, 2))
+        self.email_entry = ctk.CTkEntry(
+            form, placeholder_text="example@email.com",
+            height=40, corner_radius=8,
+            font=ctk.CTkFont(size=14),
+            fg_color="#252525", border_color="#333333"
+        )
+        self.email_entry.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(form, text="비밀번호", font=ctk.CTkFont(size=14),
+                     text_color="#888888", anchor="w").pack(fill="x", padx=16, pady=(0, 2))
+        self.pw_entry = ctk.CTkEntry(
+            form, placeholder_text="비밀번호", show="*",
+            height=40, corner_radius=8,
+            font=ctk.CTkFont(size=14),
+            fg_color="#252525", border_color="#333333"
+        )
+        self.pw_entry.pack(fill="x", padx=16, pady=(0, 10))
+
+        # 이름/학번은 회원가입 탭에서만 표시
+        self.extra_frame = ctk.CTkFrame(form, fg_color="transparent")
+        self.extra_frame.pack(fill="x")
+
+        ctk.CTkLabel(self.extra_frame, text="이름", font=ctk.CTkFont(size=14),
+                     text_color="#888888", anchor="w").pack(fill="x", padx=16, pady=(0, 2))
+        self.name_entry = ctk.CTkEntry(
+            self.extra_frame, placeholder_text="홍길동",
+            height=40, corner_radius=8,
+            font=ctk.CTkFont(size=14),
+            fg_color="#252525", border_color="#333333"
+        )
+        self.name_entry.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(self.extra_frame, text="학번", font=ctk.CTkFont(size=14),
+                     text_color="#888888", anchor="w").pack(fill="x", padx=16, pady=(0, 2))
+        self.student_id_entry = ctk.CTkEntry(
+            self.extra_frame, placeholder_text="12345678",
+            height=40, corner_radius=8,
+            font=ctk.CTkFont(size=14),
+            fg_color="#252525", border_color="#333333"
+        )
+        self.student_id_entry.pack(fill="x", padx=16, pady=(0, 14))
+
+        self.extra_frame.pack_forget()  # 처음엔 숨김
+
+        # 상태 메시지
+        self.status_label = ctk.CTkLabel(
+            self, text="",
+            font=ctk.CTkFont(size=13), text_color="red"
+        )
+        self.status_label.pack(pady=(10, 0))
+
+        # 버튼
+        self.action_btn = ctk.CTkButton(
+            self, text="로그인",
+            font=ctk.CTkFont(size=17, weight="bold"),
+            height=52, corner_radius=12,
+            fg_color="#2563eb", hover_color="#1d4ed8",
+            command=self._action
+        )
+        self.action_btn.pack(fill="x", padx=20, pady=(10, 0))
+
+        # 푸터
+        ctk.CTkLabel(
+            self,
+            text=f"{APP_AUTHOR}  ·  {APP_EMAIL}",
+            font=ctk.CTkFont(size=11), text_color="#444444"
+        ).pack(pady=(20, 0))
+
+    def _on_tab_change(self, value):
+        self.action_btn.configure(text=value)
+        self.status_label.configure(text="")
+        if value == "회원가입":
+            self.extra_frame.pack(fill="x")
+            self.geometry("400x620")
+        else:
+            self.extra_frame.pack_forget()
+            self.geometry("400x500")
+
+    def _action(self):
+        email = self.email_entry.get().strip()
+        password = self.pw_entry.get().strip()
+
+        if not email or not password:
+            self.status_label.configure(text="이메일과 비밀번호를 입력해주세요", text_color="red")
+            return
+
+        self.action_btn.configure(state="disabled", text="처리 중...")
+        self.status_label.configure(text="")
+
+        def do_auth():
+            try:
+                if self.tab_var.get() == "로그인":
+                    result = firebase_login(email, password)
+                else:
+                    result = firebase_signup(email, password)
+
+                if "idToken" in result:
+                    id_token = result["idToken"]
+                    uid = result["localId"]
+
+                    if self.tab_var.get() == "회원가입":
+                        name = self.name_entry.get().strip()
+                        student_id = self.student_id_entry.get().strip()
+                        if not name or not student_id:
+                            self.after(0, lambda: self.status_label.configure(
+                                text="이름과 학번을 입력해주세요", text_color="red"))
+                            self.after(0, lambda: self.action_btn.configure(
+                                state="normal", text="회원가입"))
+                            return
+                        # 학번 중복 확인
+                        if check_duplicate_student_id(student_id, id_token):
+                            self.after(0, lambda: self.status_label.configure(
+                                text="이미 가입된 학번입니다", text_color="red"))
+                            self.after(0, lambda: self.action_btn.configure(
+                                state="normal", text="회원가입"))
+                            return
+                        create_user_doc(uid, result.get("email", ""), name, student_id, id_token)
+                        self.after(0, lambda: self.status_label.configure(
+                            text="가입 완료! 관리자 승인 후 이용 가능합니다", text_color="green"))
+                        self.after(0, lambda: self.action_btn.configure(
+                            state="normal", text="회원가입"))
+                    else:
+                        # 로그인 시 승인 여부 확인
+                        if check_approved(uid, id_token):
+                            self.user_token = id_token
+                            self.after(0, self._on_success)
+                        else:
+                            self.after(0, lambda: self.status_label.configure(
+                                text="관리자 승인 대기 중입니다.", text_color="red"))
+                            self.after(0, lambda: self.action_btn.configure(
+                                state="normal", text="로그인"))
+                else:
+                    error = result.get("error", {}).get("message", "알 수 없는 오류")
+                    error_map = {
+                        "EMAIL_NOT_FOUND": "등록되지 않은 이메일입니다",
+                        "INVALID_PASSWORD": "비밀번호가 틀렸습니다",
+                        "INVALID_LOGIN_CREDENTIALS": "이메일 또는 비밀번호가 틀렸습니다",
+                        "EMAIL_EXISTS": "이미 사용 중인 이메일입니다",
+                        "WEAK_PASSWORD : Password should be at least 6 characters": "비밀번호는 6자 이상이어야 합니다",
+                    }
+                    msg = error_map.get(error, f"오류: {error}")
+                    self.after(0, lambda: self.status_label.configure(text=msg, text_color="red"))
+                    self.after(0, lambda: self.action_btn.configure(
+                        state="normal", text=self.tab_var.get()))
+            except Exception as e:
+                self.after(0, lambda: self.status_label.configure(
+                    text="네트워크 오류", text_color="red"))
+                self.after(0, lambda: self.action_btn.configure(
+                    state="normal", text=self.tab_var.get()))
+
+        threading.Thread(target=do_auth, daemon=True).start()
+
+    def _on_success(self):
+        self.quit()
 
 APP_NAME = "실시간 번역기 v1.0.0  |  장대현"
 APP_VERSION = "1.0.0"
@@ -324,22 +587,6 @@ class App(ctk.CTk):
             self.openai_entry.insert(0, self.config["openai"])
         self._eye_btn(openai_row, self.openai_entry)
 
-        ctk.CTkLabel(key_frame, text="DeepL",
-                     font=ctk.CTkFont(size=16), text_color="#888888", anchor="w"
-                     ).pack(fill="x", padx=16, pady=(0, 2))
-        deepl_row = ctk.CTkFrame(key_frame, fg_color="transparent")
-        deepl_row.pack(fill="x", padx=16, pady=(0, 10))
-        self.deepl_entry = ctk.CTkEntry(
-            deepl_row, placeholder_text="xxxx:fx", show="*",
-            height=44, corner_radius=8,
-            font=ctk.CTkFont(size=16),
-            fg_color="#252525", border_color="#333333"
-        )
-        self.deepl_entry.pack(side="left", fill="x", expand=True)
-        if self.config.get("deepl"):
-            self.deepl_entry.insert(0, self.config["deepl"])
-        self._eye_btn(deepl_row, self.deepl_entry)
-
         self.save_keys_var = ctk.BooleanVar(value=bool(self.config.get("openai")))
         ctk.CTkCheckBox(
             key_frame, text="API 키 저장",
@@ -473,14 +720,12 @@ class App(ctk.CTk):
     def _on_save_keys_toggle(self):
         if self.save_keys_var.get():
             openai_key = self.openai_entry.get().strip()
-            deepl_key = self.deepl_entry.get().strip()
-            if not openai_key or not deepl_key:
+            if not openai_key:
                 self.status_label.configure(text="Key를 먼저 입력해주세요", text_color="red")
                 self.save_keys_var.set(False)
                 return
             save_config({
                 "openai": openai_key,
-                "deepl": deepl_key,
                 "mode": self.mode_var.get(),
                 "language": self.lang_var.get(),
             })
@@ -501,8 +746,7 @@ class App(ctk.CTk):
 
     def _start(self):
         openai_key = self.openai_entry.get().strip()
-        deepl_key = self.deepl_entry.get().strip()
-        if not openai_key or not deepl_key:
+        if not openai_key:
             self.status_label.configure(text="API Key를 입력해주세요", text_color="red")
             return
 
@@ -511,7 +755,7 @@ class App(ctk.CTk):
         self.start_btn.configure(text="⏹  정지", fg_color="#e74c3c", hover_color="#c0392b")
         self.status_label.configure(text="🔗 연결 중...", text_color="gray")
         self.overlay = OverlayWindow(self)
-        threading.Thread(target=self._run_translator, args=(openai_key, deepl_key), daemon=True).start()
+        threading.Thread(target=self._run_translator, args=(openai_key,), daemon=True).start()
 
     def _stop(self):
         self.running = False
@@ -531,13 +775,47 @@ class App(ctk.CTk):
         if self.overlay:
             self.overlay.after(0, lambda: self.overlay.update_text(original, translated))
 
-    def _run_translator(self, openai_key, deepl_key):
-        deepl_client = deepl.Translator(deepl_key)
+    def _run_translator(self, openai_key):
+        openai_client = openai.OpenAI(api_key=openai_key)
         lang_code = LANGUAGES[self.lang_var.get()]
         mode = self.mode_var.get()
 
+        # 최근 번역 문맥 저장 (최대 5개)
+        translation_history = []
+
         def translate(text):
-            return deepl_client.translate_text(text, target_lang="KO").text
+            # 이전 대화 문맥 구성
+            context = "\n".join([
+                f"원문: {h['original']}\n번역: {h['translated']}"
+                for h in translation_history[-5:]
+            ])
+
+            system_prompt = """You are a professional real-time interpreter for video calls. Follow these rules strictly:
+
+1. Translate into natural, polite Korean using 해요체 (e.g. ~해요, ~이에요, ~예요, ~거예요).
+2. Never use 합쇼체 (~합니다, ~입니다) or informal speech (~해, ~야).
+3. Translate idioms and slang into natural Korean equivalents.
+4. Output ONLY the Korean translation. No explanations, no quotes, no notes.
+5. Keep the same length as the original. Do not add or remove meaning.
+6. If the sentence seems cut off, translate what is given as-is."""
+
+            user_prompt = f"{f'[이전 대화]{chr(10)}{context}{chr(10)}{chr(10)}' if context else ''}[번역할 문장]{chr(10)}{text}"
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            translated = response.choices[0].message.content.strip()
+
+            # 문맥 히스토리 업데이트
+            translation_history.append({"original": text, "translated": translated})
+
+            return translated
 
         def on_open(ws):
             ws.send(json.dumps({
@@ -545,10 +823,10 @@ class App(ctk.CTk):
                 "session": {
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {
-                        "model": "whisper-1",
+                        "model": "gpt-4o-transcribe",
                         **({"language": lang_code} if lang_code else {})
                     },
-                    "turn_detection": {"type": "semantic_vad", "eagerness": "high"},
+                    "turn_detection": {"type": "semantic_vad", "eagerness": "medium"},
                     "modalities": ["text"],
                     "instructions": "Never respond. You are a transcription tool only."
                 }
@@ -720,11 +998,21 @@ class App(ctk.CTk):
         threading.Thread(target=self.tray.run, daemon=True).start()
 
     def _quit(self):
+        
         self._stop()
         if self.tray:
             self.tray.stop()
         self.after(0, self.destroy)
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    login = LoginWindow()
+    login.mainloop()
+    token = getattr(login, 'user_token', None)
+    try:
+        login.destroy()
+    except Exception:
+        pass
+
+    if token:
+        app = App()
+        app.mainloop()
